@@ -1,7 +1,7 @@
 /* =========================================
  * PROJECT: SMART DOOR + ERa IOT
  * BOARD: ESP32
- * AUTHOR: FIX BY GEMINI
+ * AUTHOR: FIX BY GEMINI - FINAL STABLE VERSION
  * ========================================= */
 
 #define ERA_DEBUG
@@ -34,6 +34,10 @@ unsigned long openTime = 0;
 #define CLOSE_ANGLE  0
 #define AUTO_CLOSE_TIME 5000  // Tự đóng sau 5 giây
 
+/* ================= STATS & SETTINGS ================= */
+int openCount = 0; 
+unsigned long lockDuration = 60000; // Mặc định khóa 1 phút (60000ms)
+
 /* ================= LCD ================= */
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
@@ -58,15 +62,13 @@ String inputPass = "";
 int wrongCount = 0;
 bool isLocked = false;
 unsigned long lockTime = 0;
-#define LOCK_DURATION 60000  // Khóa 1 phút nếu sai quá 3 lần
 
 /* ================= TIMERS ================= */
 unsigned long lastSensorRead = 0;
-const long sensorInterval = 2000; // Đọc cảm biến mỗi 2 giây (tránh spam)
+const long sensorInterval = 2000; 
 
 /* ================= FUNCTIONS ================= */
 
-// Hàm kêu bíp
 void beep(int times = 1, int duration = 100) {
   for (int i = 0; i < times; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
@@ -76,7 +78,6 @@ void beep(int times = 1, int duration = 100) {
   }
 }
 
-// Cập nhật lại giao diện LCD mặc định
 void resetLCD() {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -94,13 +95,13 @@ void openDoor() {
     lcd.print("DOOR OPENED");
     beep(1, 200);
     
-    // Đồng bộ trạng thái lên App (V1)
+    // Gửi dữ liệu lên ERa
     ERa.virtualWrite(V1, 1);
-    Serial.println("Cua da MO");
+    ERa.virtualWrite(V5, "DA MO"); 
+    openCount++;
+    ERa.virtualWrite(V6, openCount);
     
-    // Sau 1s thì hiện lại màn hình nhập pass (nhưng cửa vẫn mở)
-    // delay(1000); 
-    // resetLCD(); // Tạm tắt dòng này để hiển thị chữ DOOR OPENED
+    Serial.println("Cua da MO");
   }
 }
 
@@ -113,16 +114,15 @@ void closeDoor() {
     lcd.print("DOOR CLOSED");
     beep(1, 100);
     
-    // Đồng bộ trạng thái về App (V1)
     ERa.virtualWrite(V1, 0);
-    Serial.println("Cua da DONG");
+    ERa.virtualWrite(V5, "DA DONG");
     
+    Serial.println("Cua da DONG");
     delay(1000);
     resetLCD();
   }
 }
 
-// Đo khoảng cách
 long getDistance() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -136,19 +136,50 @@ long getDistance() {
 
 /* ================= ERA HANDLERS ================= */
 
-// [QUAN TRỌNG] Hàm này xử lý khi bạn nhấn nút trên App
+// Xử lý nút bấm V1 (Bật/Tắt)
 ERA_WRITE(V1) {
-  int value = param.getInt();// Lấy giá trị 0 hoặc 1 từ nút nhấn
-  if (value == 1) {
+  int value = param.getInt();
+  if (value == 1) openDoor();
+  else closeDoor();
+}
+
+// Xử lý nhập mật khẩu từ xa (V4)
+ERA_WRITE(V4) {
+  String remotePass = param.getString();
+  if (remotePass == password) {
+    ERa.virtualWrite(V4, "DUNG MK -> MO CUA");
     openDoor();
+    delay(2000);
+    ERa.virtualWrite(V4, ""); 
   } else {
-    closeDoor();
+    ERa.virtualWrite(V4, "SAI MAT KHAU!");
+    beep(3, 100);
   }
+}
+
+// Đồng bộ số lần mở cửa (V6)
+ERA_WRITE(V6) {
+    int svVal = param.getInt();
+    if(svVal > openCount) openCount = svVal;
+}
+
+// Cài đặt thời gian khóa báo động (V7)
+ERA_WRITE(V7) {
+    int minutes = param.getInt();
+    if (minutes < 1) minutes = 1; // Tối thiểu 1 phút
+    lockDuration = minutes * 60000; // Đổi phút ra mili giây
+    
+    Serial.print("Da cai dat thoi gian khoa: ");
+    Serial.print(minutes);
+    Serial.println(" phut");
 }
 
 ERA_CONNECTED() {
   ERA_LOG(ERA_PSTR("ERa"), ERA_PSTR("Connected!"));
-  ERa.virtualWrite(V1, doorOpen ? 1 : 0); // Đồng bộ trạng thái khi mới kết nối
+  ERa.virtualWrite(V1, doorOpen ? 1 : 0);
+  
+  // Gửi thời gian hiện tại lên App (V7)
+  ERa.virtualWrite(V7, lockDuration / 60000); 
 }
 
 /* ================= SETUP ================= */
@@ -162,9 +193,8 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // Cấu hình Servo
-  doorServo.attach(SERVO_PIN);
-  doorServo.write(CLOSE_ANGLE); // Đóng cửa khi khởi động
+  doorServo.attach(SERVO_PIN, 500, 2400);
+  doorServo.write(CLOSE_ANGLE);
 
   Wire.begin();
   lcd.init();
@@ -172,7 +202,6 @@ void setup() {
   lcd.print("Connecting ERa...");
 
   ERa.begin(ssid, pass);
-
   resetLCD();
 }
 
@@ -181,33 +210,26 @@ void loop() {
   ERa.run();
   unsigned long currentMillis = millis();
 
-  /* ===== XỬ LÝ CẢM BIẾN (Mỗi 2 giây 1 lần) ===== */
-  // Không in lên LCD để tránh đè chữ mật khẩu
+  /* ===== CẢM BIẾN ===== */
   if (currentMillis - lastSensorRead > sensorInterval) {
     lastSensorRead = currentMillis;
-    
-    // 1. Đọc khoảng cách gửi lên V2 (bạn có thể tạo thêm widget Value trên App)
     long dist = getDistance();
     if (dist > 0) ERa.virtualWrite(V2, dist);
 
-    // 2. Đọc chuyển động gửi lên V3 (Widget LED hoặc Label)
     bool motion = digitalRead(PIR_PIN);
-    if (motion) {
-        ERa.virtualWrite(V3, "Motion Detected");
-        Serial.println("Phat hien chuyen dong!");
-    } else {
-        ERa.virtualWrite(V3, "Safe");
-    }
+    if (motion) ERa.virtualWrite(V3, "Motion Detected");
+    else ERa.virtualWrite(V3, "Safe");
   }
 
-  /* ===== TỰ ĐỘNG ĐÓNG CỬA ===== */
+  /* ===== TỰ ĐỘNG ĐÓNG ===== */
   if (doorOpen && currentMillis - openTime > AUTO_CLOSE_TIME) {
     closeDoor();
   }
 
-  /* ===== CHẾ ĐỘ KHÓA (BRUTE FORCE LOCK) ===== */
+  /* ===== KHÓA HỆ THỐNG (ĐÃ FIX LỖI LCD) ===== */
   if (isLocked) {
-    if (currentMillis - lockTime >= LOCK_DURATION) {
+    // Kiểm tra đã hết thời gian khóa chưa
+    if (currentMillis - lockTime >= lockDuration) {
       isLocked = false;
       wrongCount = 0;
       lcd.clear();
@@ -215,57 +237,51 @@ void loop() {
       delay(1000);
       resetLCD();
     } else {
-      // Chỉ hiển thị thông báo khóa, chặn nhập phím
-      lcd.setCursor(0,0);
-      lcd.print("SYSTEM LOCKED!  ");
-      lcd.setCursor(0,1);
-      int remain = (LOCK_DURATION - (currentMillis - lockTime)) / 1000;
-      lcd.print("Wait: "); lcd.print(remain); lcd.print("s   ");
-      return; 
+      // Logic mới: Chỉ cập nhật màn hình mỗi 1 giây
+      static unsigned long lastLCDUpdate = 0;
+      if (currentMillis - lastLCDUpdate >= 1000) {
+        lastLCDUpdate = currentMillis;
+        
+        lcd.setCursor(0,0);
+        lcd.print("SYSTEM LOCKED!  ");
+        lcd.setCursor(0,1);
+        
+        int remain = (lockDuration - (currentMillis - lockTime)) / 1000;
+        lcd.print("Wait: "); 
+        lcd.print(remain); 
+        lcd.print("s       ");
+      }
+      return; // Chặn phím
     }
   }
 
-  /* ===== XỬ LÝ BÀN PHÍM ===== */
+  /* ===== KEYPAD ===== */
   char key = keypad.getKey();
-  
   if (key) {
-    beep(1, 50); // Bíp nhẹ khi nhấn phím
-    
-    if (key == '#') { // Nút ENTER
+    beep(1, 50);
+    if (key == '#') { 
       if (inputPass == password) {
-        lcd.clear();
-        lcd.print("ACCESS GRANTED");
-        delay(500);
-        openDoor();
-        wrongCount = 0;
+        lcd.clear(); lcd.print("ACCESS GRANTED");
+        delay(500); openDoor(); wrongCount = 0;
       } else {
         wrongCount++;
-        lcd.clear();
-        lcd.print("WRONG PASSWORD");
-        beep(2, 100);
-        delay(1500);
+        lcd.clear(); lcd.print("WRONG PASSWORD");
+        beep(2, 100); delay(1500);
 
         if (wrongCount >= 3) {
           isLocked = true;
           lockTime = millis();
-          lcd.clear();
-          lcd.print("SYSTEM LOCKED!");
+          lcd.clear(); lcd.print("SYSTEM LOCKED!");
           beep(5, 200); 
-        } else {
-          resetLCD();
-        }
+        } else resetLCD();
       }
-      inputPass = ""; // Reset biến nhập
+      inputPass = ""; 
     }
-    else if (key == '*') { // Nút XÓA (CLEAR)
-      inputPass = "";
-      resetLCD();
-    }
-    else { // Nhập số
-      if (inputPass.length() < 6) { // Giới hạn độ dài pass hiển thị
+    else if (key == '*') { inputPass = ""; resetLCD(); }
+    else { 
+      if (inputPass.length() < 6) { 
         inputPass += key;
-        lcd.setCursor(0, 1);
-        lcd.print("                "); // Xóa dòng dưới
+        lcd.setCursor(0, 1); lcd.print("                "); 
         lcd.setCursor(0, 1);
         for (size_t i = 0; i < inputPass.length(); i++) lcd.print("*");
       }
